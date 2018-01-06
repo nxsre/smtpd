@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
@@ -16,29 +17,32 @@ import (
 
 var (
 	Debug      = false
-	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:<(.+)>`)
-	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
+	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:\s?<(.+)>`)
+	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:\s?<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
 
 	// Commands allowed when TLS is required but not in use as per RFC 3207. Any other command gets a 530 response.
 	allowedCmds = map[string]bool{"NOOP": true, "EHLO": true, "STARTTLS": true, "QUIT": true}
 )
 
-// Handler function called upon successful receipt of an email.
-type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
+// MailHandler function called upon successful receipt of an email.
+type MailHandler func(remoteAddr net.Addr, from string, to []string, data []byte)
+
+// AuthHandler function
+type AuthHandler func(username, password string) bool
 
 // ListenAndServe listens on the TCP network address addr
 // and then calls Serve with handler to handle requests
 // on incoming connections.
-func ListenAndServe(addr string, handler Handler, appname string, hostname string) error {
-	srv := &Server{Addr: addr, Handler: handler, Appname: appname, Hostname: hostname}
+func ListenAndServe(addr string, authHandler AuthHandler, mailHandler MailHandler, appname string, hostname string) error {
+	srv := &Server{Addr: addr, AuthHandler: authHandler, MailHandler: mailHandler, Appname: appname, Hostname: hostname}
 	return srv.ListenAndServe()
 }
 
 // ListenAndServeTLS listens on the TCP network address addr
 // and then calls Serve with handler to handle requests
 // on incoming connections. Connections may be upgraded to TLS if the client requests it.
-func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Handler, appname string, hostname string) error {
-	srv := &Server{Addr: addr, Handler: handler, Appname: appname, Hostname: hostname}
+func ListenAndServeTLS(addr string, certFile string, keyFile string, authHandler AuthHandler, mailHandler MailHandler, appname string, hostname string) error {
+	srv := &Server{Addr: addr, AuthHandler: authHandler, MailHandler: mailHandler, Appname: appname, Hostname: hostname}
 	err := srv.ConfigureTLS(certFile, keyFile)
 	if err != nil {
 		return err
@@ -49,7 +53,8 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Han
 // Server is an SMTP server.
 type Server struct {
 	Addr        string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
-	Handler     Handler
+	MailHandler MailHandler
+	AuthHandler AuthHandler
 	Appname     string
 	Hostname    string
 	Timeout     time.Duration
@@ -158,7 +163,6 @@ func (s *session) serve() {
 	var gotFrom bool
 	var to []string
 	var buffer bytes.Buffer
-
 	// Send banner.
 	s.writef("220 %s %s ESMTP Service ready", s.srv.Hostname, s.srv.Appname)
 
@@ -175,7 +179,6 @@ loop:
 			break
 		}
 		verb, args := s.parseLine(line)
-
 		// If TLS is configured and required, but not already in use, reject every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207.
 		if s.srv.TLSConfig != nil && s.srv.TLSRequired == true && s.tls == false {
 			if _, ok := allowedCmds[verb]; !ok {
@@ -258,8 +261,8 @@ loop:
 			s.writef("250 2.0.0 Ok: queued")
 
 			// Pass mail on to handler.
-			if s.srv.Handler != nil {
-				go s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
+			if s.srv.MailHandler != nil {
+				go s.srv.MailHandler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
 			}
 
 			// Reset for next mail.
@@ -316,6 +319,56 @@ loop:
 			gotFrom = false
 			to = nil
 			buffer.Reset()
+		case "AUTH":
+			authArgs := strings.Split(args, " ")
+			if len(authArgs) == 0 {
+				s.writef("500 Error: bad syntax")
+				continue
+			}
+			switch authArgs[0] {
+			case "LOGIN":
+				s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("username:")))
+				usernameB64, err := s.readLine()
+				if err != nil {
+					break
+				}
+				s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("password:")))
+				passwordB64, err := s.readLine()
+				if err != nil {
+					break
+				}
+				username, err := base64.StdEncoding.DecodeString(usernameB64)
+				if err != nil {
+					s.writef("526 Authentication failure[0]")
+					continue
+				}
+				password, err := base64.StdEncoding.DecodeString(passwordB64)
+				if err != nil {
+					s.writef("526 Authentication failure[0]")
+					continue
+				}
+				if !s.srv.AuthHandler(string(username), string(password)) {
+					s.writef("526 Authentication failure[0]")
+					continue
+				}
+				s.writef("235 Authentication successful")
+			case "PLAIN":
+				userAndPass, err := base64.StdEncoding.DecodeString(authArgs[1])
+				if err != nil {
+					return
+				}
+				userAndPass = bytes.Trim(userAndPass, "\x00")
+				userPassPair := bytes.Split(userAndPass, []byte("\x00"))
+				username := string(userPassPair[0])
+				password := string(userPassPair[1])
+				if !s.srv.AuthHandler(username, password) {
+					s.writef("526 Authentication failure[0]")
+					continue
+				}
+				s.writef("235 Authentication successful")
+			default:
+				s.writef("554 unsupport authentication method")
+			}
 		default:
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
 			s.writef("500 5.5.2 Syntax error, command unrecognized")
@@ -416,6 +469,15 @@ func (s *session) makeEHLOResponse() (response string) {
 		response += "250-STARTTLS\r\n"
 	}
 
-	response += "250 ENHANCEDSTATUSCODES"
+	// response += "250 ENHANCEDSTATUSCODES"
+	response += "250-8BITMIME"
+	response += "\r\n"
+	response += "250-AUTH=PLAIN LOGIN"
+	response += "\r\n"
+	response += "250-AUTH PLAIN LOGIN"
+	response += "\r\n"
+	response += "250-PIPELINING"
+	response += "\r\n"
+	response += "250 DSN"
 	return
 }
